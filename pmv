@@ -1,0 +1,97 @@
+#!/usr/bin/perl -Tw
+use Safe;
+use Getopt::Long qw(:config bundling);
+use strict;
+# init:
+
+#$PATH etc. is insecure, system() would fail if it wasn't unset.
+delete @ENV{qw(IFS CDPATH ENV BASH_ENV PATH)};
+
+my $doit = 0;
+my $verbose = 0;
+my $mkdir = 0;
+my $over  = 0;
+my $noover= 0;
+
+sub help();
+sub xmkdir($);
+
+GetOptions (
+	"v|verbose"   => \$verbose,
+	"e|exec"      => \$doit,
+	"m|mkdir"     => \$mkdir,
+	"h|help"      => \&help,
+	"o|overwrite" => \$over,
+	"k|keep"      => \$noover,
+) || exit(1);
+
+if(!$doit)
+	{$verbose=1};
+
+
+#while(@ARGV){
+#	if($ARGV[0] eq '-e'){shift(@ARGV);$doit=1;if($verbose==1){$verbose=0}}
+#	elsif($ARGV[0] eq '-v'){shift(@ARGV);$verbose=2}
+#	else{last}
+#}
+
+# the first parameter is our program.
+my $sb=new Safe;
+$::task=shift(@ARGV);
+
+# it's tainted by default, so we untaint it.
+$::task=~/(.*)/s;
+$::task=$1;
+
+# these commands are allowed in our rexec:
+$sb->permit_only(':base_math',':base_mem',':base_loop',':base_core',':default',
+"padsv","padav","padhv","padany",
+"regcmaybe","regcreset","regcomp","subst","substcont",
+"sprintf", 'open', "pack","unpack");
+
+for (@ARGV) {
+	/(.*)/s;
+	my $a=$1;
+	$_=$a;
+	$sb->reval("$::task");
+	if ($@) {
+		print "$::task on $sb: $@\n";
+		last;
+	}else{
+		if(defined $_ && $_ ne $a && $_ ne '') {
+			/(.*)/s;
+			my $to = $1;
+			if ($verbose) {print "'$a' -> '$to'\n"}
+			if ($doit) {
+				next if ($noover && -e $to);
+				if ($mkdir && $to =~ m,^(.*)/,
+				&& $1 ne "") {
+					xmkdir($1) || print STDERR "xmkdir $1: $!\n";
+				}
+				system('/bin/mv',($over? () : '-i'),'--',$a,$to)
+}	}	}	}
+
+sub xmkdir($) {
+	my $dir = shift;
+	return 1 if -d $dir;
+	return 1 if mkdir($dir);
+	$dir =~ s,/+$,,;
+	$dir =~ m,^(.*)/, || return 0;
+	return 0 if !xmkdir($1);
+	return mkdir($dir);
+}
+
+sub help() {
+	print <<EOF
+$0 [option] program files
+
+options:
+  -e  --exec      execute the renaming, instead of just printing it
+  -v  --verbose   print the renamigs done
+  -m  --mkdir     make directories if needed
+  -o  --overwrite overwrite files
+  -k  --keep      don't overwrite files
+
+Example: $0 's/_/ /' *
+EOF
+}
