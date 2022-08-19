@@ -7,22 +7,25 @@ use strict;
 #$PATH etc. is insecure, system() would fail if it wasn't unset.
 delete @ENV{qw(IFS CDPATH ENV BASH_ENV PATH)};
 
-my $doit = 0;
+my $doit    = 0;
 my $verbose = 0;
-my $mkdir = 0;
-my $over  = 0;
-my $noover= 0;
+my $mkdir   = 0;
+my $over    = 0;
+my $noover  = 0;
+my $do_copy  = 0;
 
 sub help();
 sub xmkdir($);
 
 GetOptions (
-	"v|verbose"   => \$verbose,
-	"e|exec"      => \$doit,
-	"m|mkdir"     => \$mkdir,
-	"h|help"      => \&help,
-	"o|overwrite" => \$over,
-	"k|keep"      => \$noover,
+	"v|verbose"           => \$verbose,
+	"e|exec"              => \$doit,
+	"m|mkdir"             => \$mkdir,
+	"c|copy"              => \$do_copy,
+	"h|help"              => \&help,
+	"o|overwrite"         => \$over,
+	"O|no-overwrite"      => \$noover,
+	"k|keep (deprecated)" => \$noover,
 ) || exit(1);
 
 if(!$doit)
@@ -66,9 +69,9 @@ for (@ARGV) {
 				next if ($noover && -e $to);
 				if ($mkdir && $to =~ m,^(.*)/,
 				&& $1 ne "") {
-					xmkdir($1) || print STDERR "xmkdir $1: $!\n";
+					xmkdir($1) || print STDERR "mkdir $1: $!\n";
 				}
-				system('/bin/mv',($over? () : '-i'),'--',$a,$to)
+				system(($do_copy? '/bin/cp' : '/bin/mv'),($over? () : '-i'),'--',$a,$to)
 }	}	}	}
 
 sub xmkdir($) {
