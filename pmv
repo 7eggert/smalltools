@@ -1,5 +1,6 @@
 #!/usr/bin/perl -Tw
 use Safe;
+use File::Temp qw( );
 use Getopt::Long qw(:config bundling);
 use strict;
 # init:
@@ -7,44 +8,68 @@ use strict;
 #$PATH etc. is insecure, system() would fail if it wasn't unset.
 delete @ENV{qw(IFS CDPATH ENV BASH_ENV PATH)};
 
-my $doit    = 0;
-my $verbose = 0;
-my $mkdir   = 0;
-my $over    = 0;
-my $noover  = 0;
-my $do_copy  = 0;
+my $doit        = 0;
+my $verbose     = 0;
+my $mkdir       = 0;
+my $over        = 0;
+my $noover      = 0;
+my $do_copy     = 0;
+my $do_link     = 0;
+my $do_symlink  = 0;
+my $follow_link = 0;
+my $do_readlink = 0;
+my $cp_option   = undef;
 
 sub help();
 sub xmkdir($);
 
 GetOptions (
-	"v|verbose"           => \$verbose,
-	"e|exec"              => \$doit,
-	"m|mkdir"             => \$mkdir,
 	"c|copy"              => \$do_copy,
+	"e|exec"              => \$doit,
 	"h|help"              => \&help,
+	"H|follow-link"       => \$follow_link,
+	"k|keep (deprecated)" => \$noover,
+	"l|link"              => \$do_link,
+	"R|readlink"          => \$do_readlink,
+	"m|mkdir"             => \$mkdir,
 	"o|overwrite"         => \$over,
 	"O|no-overwrite"      => \$noover,
-	"k|keep (deprecated)" => \$noover,
+	"s|symlink"           => \$do_symlink,
+	"v|verbose"           => \$verbose,
 ) || exit(1);
 
-if(!$doit)
-	{$verbose=1};
+if (!$doit)
+	{ $verbose = 1 };
+if ($do_link || $do_symlink)
+	{ $do_copy = 1 };
 
-
-#while(@ARGV){
-#	if($ARGV[0] eq '-e'){shift(@ARGV);$doit=1;if($verbose==1){$verbose=0}}
-#	elsif($ARGV[0] eq '-v'){shift(@ARGV);$verbose=2}
-#	else{last}
-#}
+if ($do_copy) {
+	if ($do_readlink) {
+		print STDERR "Can't copy while editing symlinks\n";
+		exit(1);
+	}
+	$cp_option = $follow_link? '-H' : $do_link? '-l' : $do_symlink? '-s' : '-d';
+} else {
+	if ($follow_link) {
+		print STDERR "Can't follow links while moving, only while copying\n";
+		exit(1);
+	}
+}
+if ($do_link && $do_symlink) {
+	print STDERR "can either link or symlink";
+	exit(1);
+}
 
 # the first parameter is our program.
 my $sb=new Safe;
 $::task=shift(@ARGV);
-
+if (!defined $::task) {
+	help();
+	exit(1);
+}
 # it's tainted by default, so we untaint it.
-$::task=~/(.*)/s;
-$::task=$1;
+$::task =~ /(.*)/s;
+$::task = $1;
 
 # these commands are allowed in our rexec:
 $sb->permit_only(':base_math',':base_mem',':base_loop',':base_core',':default',
@@ -54,28 +79,82 @@ $sb->permit_only(':base_math',':base_mem',':base_loop',':base_core',':default',
 
 for (@ARGV) {
 	/(.*)/s;
-	my $a=$1;
+	my $a = $1;
+	my $oldlink = undef;
 	$_=$a;
+	if ($do_readlink) {
+		if (!-l $a) {
+			print STDERR "not a link: $a\n";
+			next;
+		}
+		$_ = $oldlink = readlink($a);
+		if (!defined $_) {
+			print STDERR "readlink $a: $!\n";
+			next;
+		}
+		if ($noover && -e $oldlink) {
+			print STDERR "skipping valid link: $a ($oldlink)\n";
+			next;
+		}
+	}
 	$sb->reval("$::task");
 	if ($@) {
 		print "$::task on $sb: $@\n";
 		last;
 	}else{
-		if(defined $_ && $_ ne $a && $_ ne '') {
-			/(.*)/s;
-			my $to = $1;
-			if ($verbose) {print "'$a' -> '$to'\n"}
-			if ($doit) {
-				next if ($noover && -e $to);
-				if ($mkdir && $to =~ m,^(.*)/,
-				&& $1 ne "") {
-					xmkdir($1) || print STDERR "mkdir $1: $!\n";
-				}
-				system(($do_copy? '/bin/cp' : '/bin/mv'),($over? () : '-i'),'--',$a,$to)
-}	}	}	}
+		next if !defined $_;
+		next if $_ eq '';
+		next if !$do_readlink && ($_ eq $a);
+		next if  $do_readlink && ($_ eq $oldlink);
+		/(.*)/s;
+		my $to = $1;
+		if ($verbose) {
+			print "'$a' -> '$to'\n" if !$do_readlink;
+			print "'$a': '$oldlink' -> '$to'\n" if $do_readlink;
+		}
+		next if !$doit;
+		if ($do_readlink) {
+			my ($dir, $basename) = $a =~ m,^(.*)/(.*),;
+			# this creates a temporary symlink in the same
+			# directory as the file and then moves the
+			# file to the old name. This prevents an intermediate
+			# situation where $a doesn't exist
+			my $res = 0;
+			$dir='.' if !defined $dir;
+			$basename = $a if !defined $basename;
+			$basename .= "XXXXXXXX";
+			my $tmpname = File::Temp::tempnam( $dir.'/', $basename );
+			eval { $res = symlink($to, $tmpname); };
+			if (!$res) {
+				print STDERR "symlink $a: $!\n";
+				next;
+			} elsif ($@ ne '') {
+				print STDERR "symlink $a: $@\n";
+				next;
+			}
+			if (!rename($tmpname, $a)) {
+				print STDERR "rename $tmpname -> $a: $!\n";
+				unlink $tmpname; # TODO? Check errors?
+				# next;
+			}
+		} else {
+			my ($dir, $basename) = $to =~ m,^(.*)/(.*),;
+			next if ($noover && -e $to);
+			if ($mkdir && defined $dir
+			&& $dir ne "") {
+				if (!xmkdir($dir)) {
+					 print STDERR "mkdir $dir: $!\n";
+					 next;
+			}	}
+			system(($do_copy? ('/bin/cp', $cp_option) : '/bin/mv'),
+				($over? () : '-i'),
+				'--', $a, $to)
+}	}	}
 
 sub xmkdir($) {
 	my $dir = shift;
+	return undef if !defined $dir;
+	return 1 if $dir eq '';
 	return 1 if -d $dir;
 	return 1 if mkdir($dir);
 	$dir =~ s,/+$,,;
@@ -89,11 +168,22 @@ sub help() {
 $0 [option] program files
 
 options:
-  -e  --exec      execute the renaming, instead of just printing it
-  -v  --verbose   print the renamigs done
-  -m  --mkdir     make directories if needed
-  -o  --overwrite overwrite files
-  -k  --keep      don't overwrite files
+  -e  --exec         execute the renaming, instead of just printing it
+  -v  --verbose      print the renamigs done
+  -m  --mkdir        make directories if needed
+  -o  --overwrite    overwrite files (don't ask)
+  -O  --no-overwrite don't overwrite files
+                     this also skips valid symlinks
+  -k  --keep         don't overwrite files (deprecated)
+
+  -c  --copy         copy instead of moving
+  -H  --follow-link  follow links (only while copying, same as cp -H)
+  -l  --link         make links (implies -c)
+  -s  --symlink      make symlinks (implies -c; conflicts -l)
+
+  -R  --readlink     read and change links (conflicts -c)
+
+  -h --help          this message
 
 Example: $0 's/_/ /' *
 EOF
