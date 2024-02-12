@@ -1,0 +1,91 @@
+#!/usr/bin/perl
+use Data::Dumper;
+
+for my $f (@ARGV) {
+	next unless -e $f;
+	my $fc;
+	open($fc, '-|', 'fc-query', $f);
+	my $fdata = {};
+	my $ext;
+	while (<$fc>) {
+		chomp;
+		my ($k, $v);
+		my $ok = 
+		   !!(($k, $v) = $_ =~ /^\t(\w+): "([^"]+)"\(s\)/)
+		|| !!(($k, $v) = $_ =~ /^\t(\w+): (.*)$/);
+		next if !$ok;
+		for my $x (qw( family style fullname foundry postscriptname fontformat)) {
+			next if $x ne $k;
+			$fdata->{$k} = $v;
+			#print "$k → $v\n";
+		}
+	}
+	if (!defined $fdata->{fullname}
+	&&   defined $fdata->{family}
+	&&   defined $fdata->{style}) {
+		$fdata->{fullname} = "$fdata->{family}-$fdata->{style}";
+	}
+	if (!defined $fdata->{fullname}
+	&&   defined $fdata->{postscriptname}) {
+		$fdata->{fullname} = $fdata->{postscriptname};
+	}
+	$fdata->{foundry} = "unknown" unless defined $fdata->{foundry};
+
+	if ($fdata->{fontformat} eq "TrueType") {
+		$ext = "ttf";
+	} elsif ($fdata->{fontformat} eq "Windows FNT") {
+		$ext = "fon";
+	} elsif ($fdata->{fontformat} eq "Type 1") {
+		$ext = "pfb";
+	} elsif ($fdata->{fontformat} eq "BDF") {
+		#TODO: The name is not read correctly, look at the file containing a line saying "FONT %s\n"
+		$ext = "bdf";
+	} else {
+		print "$f: Unknown format $fdata->{fontformat}\n";
+		next;
+	};
+
+	if (defined $fdata->{fullname}) {
+		$fdata->{fullname} =~ y,/:,-_/,;
+		my $destd = "$ext/$fdata->{foundry}";
+		my $destbase = "$destd/$fdata->{fullname}";
+		my $dest = "$destbase.$ext";
+		if (-e $dest) {
+			print "$f: can't move, '$dest' exists\n";
+			next;
+		}
+		mkdir($ext);
+		mkdir($destd);
+		if (!-d $destd) {
+			print "can't mkdir $destd: $!";
+			next
+		}
+		if ($ext eq "pfb") {
+			my ($upper, $base);
+			if ($f =~ /(.*)\.PF(B)$/i) {
+				$upper = $2 eq "B";
+				$base = $1;
+				$f2 = $1.($2 eq 'B'? ".PFM" : ".pfm");
+				if (!-e $f2) {
+					"$f: missing $f2\n";
+					next;
+				}
+				rename($f, $dest);
+				for my $ext2 (qw( pfm afm cfg inf otl sfp vfm wfn wid )) {
+					my $f2 = $upper? "$base.\U$ext2" : "$base.$ext2";
+					my $dest2 = "$destbase.$ext2";
+					rename($f2, $dest2) if defined $f2;
+				}
+			} else {
+				print "$f: File name expected to be *.pfb, but it isn't\n";
+				next;
+			}
+		} else {
+			print "mv '$f' '$dest'\n";
+			rename($f, $dest);
+		}
+	} else {
+		print "can't determine full name for $f\n";
+		print Data::Dumper->Dump([$fdata],["%fdata"]);
+	}
+}
