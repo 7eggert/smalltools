@@ -1,0 +1,238 @@
+#!/usr/bin/perl
+use warnings;
+use strict;
+use File::stat;
+use Fcntl qw(:mode);
+use Digest;
+use Storable qw(lock_nstore lock_retrieve);
+use Getopt::Long qw(:config bundling);
+use File::Compare;
+
+use Data::Dumper;
+my $dodumps = 0;
+
+use BE::Dir;
+
+my @files;
+my %dirs; # $dirs{$dirname}{filename} = {name => $dir/$file", stat => …, sha512 => … }
+
+my %dirs_update_cache;
+
+my $dentskipre = qr/^\.sha512cache$|\.sha512$|^\.sha512\.d$/i;
+
+# $opts->{nosha} $opts->{nousecache} $opts->{nowritecache}
+#noshafile
+sub sha_collect($@);
+sub sha_collect($@)
+{
+	my $opts = shift;
+	my $ctx = Digest->new("SHA-512");
+	for my $dir (@_) {
+		next if ($dirs{$dir});
+		#my $dirhash = $dirs{$dir};
+		#if (!defined $dirhash) {
+		$dirs{$dir} = {};
+		my $dirhash = $dirs{$dir};
+
+		my $cached = lock_retrieve("$dir/.sha512cache") if -e "$dir/.sha512cache" && !$opts->{nousecache};
+		$cached={} if (!$cached);
+
+		my $dents = get_direntries($dir);
+		next if !defined $dents;
+		
+		for my $f (@$dents) {
+			next if $f eq '.' || $f eq '..';
+			next if $f =~ $dentskipre;
+			if ($cached->{$f}) {
+				$dirhash->{$f} = $cached->{$f};
+				$dirhash->{$f}{mode} = $opts->{mode};
+				$dirhash->{$f}{d} = $dir;
+				delete $dirhash->{$f}{dup};
+			}
+			if (defined $dirhash->{$f} && defined $dirhash->{$f}{stat}) {
+				next if $opts->{nosha};
+				next if defined $dirhash->{$f}{sha512};
+			}
+			my $fdata;
+			if (!defined ($fdata = $dirhash->{$f}) || !defined $dirhash->{$f}{stat}) {
+				my $stat = stat("$dir/$f");
+				if (S_ISDIR($stat->mode)) {
+					sha_collect($opts, "$dir/$f");
+					next;
+				} else {
+					$fdata = $dirhash->{$f} = {
+						d => $dir,
+						f => $f,
+						mode => $opts->{mode},
+						stat => $stat
+					};
+				}
+			}
+			if (!$opts->{nosha} && !defined $fdata->{sha512}) {
+				$fdata->{sha512} = sha512_file("$dir/$f");
+			}
+			$cached->{$f} = $dirhash->{$f};
+			$dirs_update_cache{$dir} = 1;
+		}
+		#lock_nstore($cached, "$dir/.sha512cache") unless $opts->{nowritecache};
+	}
+}
+
+#noshafile $opts->{noshafilewrite}
+sub sha512_file($$$)
+{
+	my ($opts, $dir, $file) = @_;
+	return $dirs{$dir}{$file}{sha512} if exists $dirs{$dir}{$file}{sha512};
+	my $shafn = "$dir/.sha512.d/$file";
+	my $sha_fh;
+	my $sha_rdonly;
+	my $sha;
+	if (!$opts->{noshafile} && -f $shafn) {
+		if (!open $sha_fh, "+<", $shafn) {
+			if (open $sha_fh, "<", $shafn) {
+				$sha_rdonly = 1;
+			} else {
+				$sha_fh = undef;
+			}
+		}
+		if ($sha_fh) {
+			my $line = <$sha_fh>;
+			if ($line =~ /^([a-fA-F0-9]{128})\b/) {
+				$sha = $1;
+			}
+		}
+	}
+	if ($sha) {
+		$dirs_update_cache{$dir} = 1;
+		return $dirs{$dir}{$file}{sha512} = $sha;
+	}
+
+	open(my $fh, '<', "$dir/$file") or die "Can't open '$file': $!";
+	binmode($fh);
+	$sha = Digest->new("SHA-512")->addfile($fh)->hexdigest;
+	unless ($sha_rdonly || $opts->{noshafilewrite}) {
+		if ($sha_fh) {
+			seek($sha_fh, 0, 0);
+		} else {
+			mkdir("$dir/.sha512.d");
+			if (!open($sha_fh, ">", $shafn))
+				{ $sha_fh = undef; }
+		}
+		if ($sha_fh) {
+			print $sha_fh "$sha -\n";
+		}
+	}
+	return $dirs{$dir}{$file}{sha512} = $sha;
+}
+
+my %GOptions;
+
+sub add_dir_shadelete {
+	shift;
+	return sha_collect({%GOptions, nosha => 1, mode=>"shadelete"}, shift);
+}
+
+sub add_dir_delete {
+	shift;
+	return sha_collect({%GOptions, nosha => 1, mode=>"delete"}, shift);
+}
+
+sub help(){die;}
+
+GetOptions (
+	"noshafile"           => \$GOptions{noshafile},
+	"noshafilewrite"      => \$GOptions{noshafilewrite},
+	"nousecache"          => \$GOptions{nousecache},
+	"nowritecache"        => \$GOptions{nowritecache},
+	
+	"D|shadelete=s"       => \&add_dir_shadelete,
+	"d|delete=s"          => \&add_dir_delete,
+	"e|exec"              => \$GOptions{exec},
+	"h|help"              => \&help,
+	"v|verbose"           => \$GOptions{verbose},
+) || exit(1);
+
+sha_collect({%GOptions, nosha => 1, mode=>"normal"}, @ARGV);
+
+print Data::Dumper->Dump([\%dirs, \%dirs_update_cache], ["%dirs", "%dirs_update_cache"]) if $dodumps;
+
+for my $dir (keys %dirs) {
+	my $d = $dirs{$dir};
+	for my $file (keys %$d) {
+		my $f = $d->{$file};
+		if (!defined $f->{stat}) {
+			print "ERROR: $d/$file should have stat data, skipping\n";
+			next;
+		}
+		my $size = $f->{stat}->size;
+		my ($bh, $bl) = (int($size / 4096), $size % 4096);
+		push(@{$files[$bh][$bl]}, $f);
+	}
+}
+
+for (my $i = 0; $i < @files; $i++) {
+	next if !exists $files[$i];
+	my $sb = $files[$i];
+	for (my $j=0; $j < @$sb; $j++) {
+		next if !exists $sb->[$j];
+		my $fx = $sb->[$j];
+		next if 1 == @$fx;
+		#print "$i $j ".($i*4096+$j)." ".1*@$fx."\n";
+		print "file group size $i * 4096 + $j == ".($i*4096+$j)."\n" if $GOptions{verbose};
+		for (my $k=0; $k < @$fx; $k++) {
+			my $fxk = $fx->[$k];
+			my $namek = "$fxk->{d}/$fxk->{f}";
+			if (0 == $i && 0 == $j) {
+				$fxk->{sha512} = "0cf9180a764aba863a67b6d72f0918bc131c6772642cb2dce5a34f0a702f9470ddc2bf125c12198b1995c233c34b4afd346c54a2334c350a948a51b6e8b4e6b6";
+			} else {
+				print "sha512($namek)\n"  if $GOptions{verbose};
+				$fxk->{sha512} = sha512_file(\%GOptions, $fxk->{d}, $fxk->{f});
+			}
+			print " $namek: $fxk->{sha512} $fxk->{mode}\n" if $GOptions{verbose};;
+		}
+		for (my $k=0; $k < @$fx; $k++) {
+			next if !exists $fx->[$k];
+			my $fxk = $fx->[$k];
+			my $namek = "$fxk->{d}/$fxk->{f}";
+			if ($fxk->{mode} eq 'shadelete' || $fxk->{mode} eq 'delete') {
+				for (my $l =0; $l<@$fx; $l++) {
+					next if $l == $k;
+					next if !exists $fx->[$l];
+					my $fxl = $fx->[$l];
+					next if $fxl->{dup};
+					next if $fxk->{sha512} ne $fxl->{sha512};
+					my $namel = "$fxl->{d}/$fxl->{f}";
+					next if $namek eq $namel;
+					
+					if ($fxk->{mode} eq 'delete' && compare($namek, $namel)) {
+						print "non-equal files with same sha sum: $namek; $namel\n";
+						next;
+					}
+					
+					print (($GOptions{exec}?'':'# echo ')."rm $namek && keep $namel\n");
+					if ($GOptions{exec}) {
+						unlink($namek);
+						unlink("$fxk->{d}/.sha512.d/$fxk->{f}");
+						delete $fx->[$k];
+					} else {
+						$fxk->{dup}=1;
+					}
+					goto next_k;
+				}
+			}
+			next_k:
+		}
+		
+	}
+}
+
+print Data::Dumper->Dump([\%dirs, \%dirs_update_cache], ["%dirs", "%dirs_update_cache"]) if $dodumps;
+
+unless ($GOptions{nowritecache}) {
+	for my $k (keys %dirs_update_cache) {
+		next unless $dirs_update_cache{$k};
+		lock_nstore($dirs{$k}, "$k/.sha512cache") && print "wrote $k/.sha512cache\n";;
+	}
+}
+
+
